@@ -1,13 +1,9 @@
 {
   "name": "telegram-capture",
   "version": "1.0.0",
-  "description": "Authorized security testing tool — Vercel + Telegram",
+  "description": "Vercel + Telegram capture tool",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "vercel dev",
-    "deploy": "vercel --prod"
-  },
   "dependencies": {
     "form-data": "^4.0.1",
     "node-fetch": "^3.3.2"
