@@ -1,113 +1,72 @@
 import fetch from 'node-fetch';
 import FormData from 'form-data';
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const DEFAULT_CHAT_ID = process.env.DEFAULT_CHAT_ID || '';
-const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || '30', 10);
-
-const ipCounts = new Map();
-
-function getClientIP(request) {
-  return request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-    || request.headers.get('x-real-ip')
-    || 'unknown';
-}
-
-function checkRateLimit(ip) {
-  const now = Math.floor(Date.now() / 60000);
-  const key = ip + ':' + now;
-  const count = (ipCounts.get(key) || 0) + 1;
-  ipCounts.set(key, count);
-  if (ipCounts.size > 1000) {
-    const currentKey = ip + ':' + now;
-    for (const [k] of ipCounts) { if (k !== currentKey) ipCounts.delete(k); }
-  }
-  return count <= RATE_LIMIT;
-}
-
 export const config = { api: { bodyParser: false } };
 
-export default async function handler(request, response) {
-  response.setHeader('Access-Control-Allow-Origin', '*');
-  response.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
 
-  if (request.method === 'OPTIONS') return response.status(204).end();
-  if (request.method !== 'POST') return response.status(405).json({ ok: false, description: 'Method not allowed' });
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return res.status(500).json({ ok: false, error: 'BOT_TOKEN not set' });
 
-  const clientIP = getClientIP(request);
-  if (!checkRateLimit(clientIP)) {
-    return response.status(429).json({ ok: false, description: 'Rate limit exceeded' });
-  }
-
-  if (!BOT_TOKEN) {
-    return response.status(500).json({ ok: false, description: 'Server config error: TELEGRAM_BOT_TOKEN not set' });
-  }
+  const ct = req.headers['content-type'] || '';
+  if (!ct.includes('multipart/form-data')) return res.status(400).json({ ok: false, error: 'Need multipart' });
 
   try {
-    const contentType = request.headers['content-type'] || '';
-    if (!contentType.includes('multipart/form-data')) {
-      return response.status(400).json({ ok: false, description: 'Content-Type must be multipart/form-data' });
-    }
-
-    // Read raw body
     const chunks = [];
-    for await (const chunk of request) { chunks.push(chunk); }
-    const rawBody = Buffer.concat(chunks);
+    for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks);
+    const boundary = ct.split('boundary=')[1]?.trim();
+    if (!boundary) return res.status(400).json({ ok: false, error: 'No boundary' });
 
-    const boundary = contentType.split('boundary=')[1]?.trim();
-    if (!boundary) return response.status(400).json({ ok: false, description: 'Missing boundary' });
-
-    // Parse multipart
-    const fields = {};
-    const files = {};
-    const parts = rawBody.toString('binary').split('--' + boundary);
+    const parts = raw.toString('binary').split('--' + boundary);
+    let chatId = '', caption = '', fileData = null, fileName = 'photo.jpg', fileType = 'image/jpeg';
 
     for (const part of parts) {
       if (part.trim() === '' || part.trim() === '--') continue;
-      const headerEnd = part.indexOf('\r\n\r\n');
-      if (headerEnd === -1) continue;
-      const headerSection = part.substring(0, headerEnd);
-      const nameMatch = headerSection.match(/name="([^"]+)"/);
-      if (!nameMatch) continue;
-      const fieldName = nameMatch[1];
-      const filenameMatch = headerSection.match(/filename="([^"]+)"/);
+      const hEnd = part.indexOf('\r\n\r\n');
+      if (hEnd === -1) continue;
+      const hs = part.substring(0, hEnd);
+      const nm = hs.match(/name="([^"]+)"/);
+      if (!nm) continue;
+      const field = nm[1];
+      const fnMatch = hs.match(/filename="([^"]+)"/);
 
-      if (filenameMatch) {
-        const contentTypeMatch = headerSection.match(/Content-Type:\s*([^\r\n]+)/i);
-        const fileType = contentTypeMatch ? contentTypeMatch[1].trim() : 'application/octet-stream';
-        const binaryStart = part.indexOf('\r\n\r\n') + 4;
-        const binaryEnd = part.lastIndexOf('\r\n--');
-        const binaryPart = part.substring(binaryStart, binaryEnd !== -1 ? binaryEnd : part.length);
-        files[fieldName] = { filename: filenameMatch[1], contentType: fileType, data: Buffer.from(binaryPart, 'binary') };
+      if (fnMatch) {
+        const ctMatch = hs.match(/Content-Type:\s*([^\r\n]+)/i);
+        fileType = ctMatch ? ctMatch[1].trim() : 'image/jpeg';
+        fileName = fnMatch[1];
+        const bStart = hEnd + 4;
+        const bEnd = part.lastIndexOf('\r\n--');
+        const bPart = part.substring(bStart, bEnd !== -1 ? bEnd : part.length);
+        fileData = Buffer.from(bPart, 'binary');
       } else {
-        fields[fieldName] = part.substring(headerEnd + 4).replace(/\r\n--$/, '').replace(/\r\n$/, '');
+        const val = part.substring(hEnd + 4).replace(/\r\n--$/, '').replace(/\r\n$/, '');
+        if (field === 'chat_id') chatId = val;
+        if (field === 'caption') caption = val;
       }
     }
 
-    const chatId = fields.chat_id || DEFAULT_CHAT_ID;
-    if (!chatId) return response.status(400).json({ ok: false, description: 'chat_id is required' });
+    if (!chatId) return res.status(400).json({ ok: false, error: 'chat_id required' });
+    if (!fileData) return res.status(400).json({ ok: false, error: 'photo required' });
 
-    const photo = files.photo;
-    if (!photo) return response.status(400).json({ ok: false, description: 'photo file is required' });
-    if (photo.data.length > 10 * 1024 * 1024) return response.status(400).json({ ok: false, description: 'Photo exceeds 10MB limit' });
+    const fd = new FormData();
+    fd.append('chat_id', chatId);
+    fd.append('photo', fileData, { filename: fileName, contentType: fileType });
+    if (caption) { fd.append('caption', caption.substring(0, 1024)); fd.append('parse_mode', 'HTML'); }
 
-    const tgForm = new FormData();
-    tgForm.append('chat_id', chatId);
-    tgForm.append('photo', photo.data, { filename: photo.filename, contentType: photo.contentType });
-    const caption = fields.caption || '';
-    if (caption) { tgForm.append('caption', caption.substring(0, 1024)); tgForm.append('parse_mode', 'HTML'); }
-
-    const tgResponse = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
-      method: 'POST', body: tgForm, headers: tgForm.getHeaders(),
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
+      method: 'POST', body: fd, headers: fd.getHeaders(),
     });
-
-    const tgResult = await tgResponse.json();
-    if (!tgResult.ok) console.error('Telegram API error:', tgResult);
-    return response.status(tgResponse.status).json(tgResult);
-
-  } catch (error) {
-    console.error('sendPhoto error:', error);
-    return response.status(500).json({ ok: false, description: 'Internal error: ' + error.message });
+    const j = await r.json();
+    if (!j.ok) console.error('Telegram error:', j);
+    return res.status(r.status).json(j);
+  } catch (e) {
+    console.error('sendPhoto error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
 }
